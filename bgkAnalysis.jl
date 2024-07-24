@@ -77,7 +77,7 @@ function computeJacobian!(Jij::AbstractArray{Float64}, inputPops::AbstractArray{
     end
 end
 
-function eigenvalueDecomp!(eigenvalues::AbstractArray{ComplexF64}, Jij_comp::AbstractArray{ComplexF64}, k::AbstractArray{Float64}, lat::Lattice)
+function eigenvalueDecomp!(eigenvalues::AbstractArray{ComplexF64}, nsEigs::AbstractArray{ComplexF64}, indicator::AbstractArray{Int64}, Jij_comp::AbstractArray{ComplexF64}, k::AbstractArray{Float64}, lat::Lattice, rhoBar::Float64, uBar::Vector{Float64}, desiredViscosity::Float64)
     for i in 1:lat.q
         kDotC = dot(k, lat.c[i, :]);
         Jij_comp[i, :] .*= exp(im*kDotC);
@@ -85,7 +85,39 @@ function eigenvalueDecomp!(eigenvalues::AbstractArray{ComplexF64}, Jij_comp::Abs
 
     eigenDecomp = eigen(Jij_comp);
     eigenvalues .= log.(eigenDecomp.values)./im;
-    return nothing;
+
+    NSMat = complex(zeros(3,3));
+    NSMat[1, :] = [dot(k, uBar) rhoBar*k[1] rhoBar*k[2]];
+    NSMat[2, :] = [k[1]*(1/lat.invCs2)/rhoBar dot(k,uBar) + im*desiredViscosity*(dot(k,k) + k[1]^2) im*desiredViscosity*k[1]*k[2]];
+    NSMat[3, :] = [k[2]*(1/lat.invCs2)/rhoBar im*desiredViscosity*k[1]*k[2] dot(k,uBar) + im*desiredViscosity*(dot(k,k) + k[2]^2)];
+
+    nsEigenDecomp = eigen(NSMat);
+    nsEigs .= nsEigenDecomp.values;
+
+    for i in 1:lat.q
+        rhoFluctuation = sum(eigenDecomp.vectors[:, i]);
+        momFluctuation = sum([eigenDecomp.vectors[:, i] .* lat.c[:, 1] eigenDecomp.vectors[:, i] .* lat.c[:, 2]], dims=1)';
+
+        uFluctuation = (momFluctuation - rhoFluctuation*uBar)/rhoBar;
+
+        Vp = [rhoFluctuation; uFluctuation];
+
+        R = inv(nsEigenDecomp.vectors)*Vp;
+        R = norm.(R);
+        threshold = 0.99;
+        nonObservableThreshold = 0.001;
+        if norm(R) < nonObservableThreshold
+            indicator[i] = -3; #non observable
+        elseif R[1] > threshold
+            indicator[i] = -1; #negative acoustic 
+        elseif R[2] > threshold
+            indicator[i] = 0; #shear
+        elseif R[3] > threshold
+            indicator[i] = 1; #positive acoustic
+        else
+            indicator[i] = -2; # non physical
+        end
+    end
 end
 
 rhoBar = 1.0;
@@ -102,6 +134,7 @@ uWrk = zeros(2,1);
 
 desiredViscosity = 10.0^-6;
 tau = desiredViscosity*3 + 0.5;
+# tau = 1E-5 + 0.5;
 omega = 1/tau;
 
 Jij = zeros(D2Q9.q, D2Q9.q);
@@ -113,9 +146,13 @@ kx = LinRange(0, pi, nEig);
 eigOmega = complex(zeros(D2Q9.q, nEig));
 Jij_comp = complex(Jij);
 
+nsEigOmega = complex(zeros(3, nEig));
+
+indicator = zeros(Int64, D2Q9.q, nEig); #0 --> shear wave, -1: left acoustic, +1: right acoustic, -2:: non physical, -3: non observable
+
 for i in 1:nEig
     Jij_comp .= complex(Jij);
-    eigenvalueDecomp!(@view(eigOmega[:, i]), Jij_comp, [kx[i], 0.], D2Q9);
+    eigenvalueDecomp!(@view(eigOmega[:, i]), @view(nsEigOmega[:, i]), @view(indicator[:, i]), Jij_comp, [kx[i], 0.], D2Q9, rhoBar, uBar, desiredViscosity)
 end
 
 eigOmegaReal = real(eigOmega);
@@ -123,7 +160,19 @@ eigOmegaImag = imag(eigOmega);
 
 omegaRealPlot = plot();
 for i in 1:D2Q9.q
-    scatter!(kx, eigOmegaReal[i, :]);
+    for j in 1:nEig
+        if indicator[i, j] == -3
+            scatter!([kx[j]], [eigOmegaReal[i, j]], markershape=:diamond, markercolor=:grey, markeralpha=0.2, legend=false);
+        elseif indicator[i, j] == -2
+            scatter!([kx[j]], [eigOmegaReal[i, j]], markershape=:x, markercolor=:black, legend=false);
+        elseif indicator[i, j] == -1
+            scatter!([kx[j]], [eigOmegaReal[i, j]], markershape=:ltriangle, markercolor=:green, legend=false);
+        elseif indicator[i, j] == 0
+            scatter!([kx[j]], [eigOmegaReal[i, j]], markershape=:circle, markercolor=:red, legend=false);
+        elseif indicator[i, j] == 1
+            scatter!([kx[j]], [eigOmegaReal[i, j]], markershape=:rtriangle, markercolor=:blue, legend=false);
+        end
+    end
 end
 xlims!(0, pi);
 ylims!(-1.2*pi, 1.2*pi);
@@ -132,11 +181,45 @@ ylabel!("ω_r");
 
 omegaImagPlot = plot();
 for i in 1:D2Q9.q
-    scatter!(kx, eigOmegaImag[i, :]./(-desiredViscosity));
+    for j in 1:nEig
+        if indicator[i, j] == -3
+            scatter!([kx[j]], [eigOmegaImag[i, j]/(-desiredViscosity)], markershape=:diamond, markercolor=:grey, markeralpha=0.2, legend=false);
+        elseif indicator[i, j] == -2
+            scatter!([kx[j]], [eigOmegaImag[i, j]/(-desiredViscosity)], markershape=:x, markercolor=:black, legend=false);
+        elseif indicator[i, j] == -1
+            scatter!([kx[j]], [eigOmegaImag[i, j]/(-desiredViscosity)], markershape=:ltriangle, markercolor=:green, legend=false);
+        elseif indicator[i, j] == 0
+            scatter!([kx[j]], [eigOmegaImag[i, j]/(-desiredViscosity)], markershape=:circle, markercolor=:red, legend=false);
+        elseif indicator[i, j] == 1
+            scatter!([kx[j]], [eigOmegaImag[i, j]/(-desiredViscosity)], markershape=:rtriangle, markercolor=:blue, legend=false);
+        end
+    end
 end
 xlims!(0, pi);
 ylims!(-14, 0.1);
 xlabel!("k_x");
 ylabel!("ω_i/ν");
+
+nsEigOmegaReal = real(nsEigOmega);
+nsEigOmegaImag = imag(nsEigOmega);
+
+nsOmegaRealPlot = plot();
+for i in 1:3
+    scatter!(kx, nsEigOmegaReal[i, :]);
+end
+xlims!(0, pi);
+ylims!(-1.2*pi, 1.2*pi);
+xlabel!("k_x");
+ylabel!("ω_r");
+
+nsOmegaImagPlot = plot();
+for i in 1:3
+    scatter!(kx, nsEigOmegaImag[i, :]./(-desiredViscosity));
+end
+xlims!(0, pi);
+ylims!(-14, 0.1);
+xlabel!("k_x");
+ylabel!("ω_i/ν");
+
 
 println("done");
